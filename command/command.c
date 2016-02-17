@@ -30,6 +30,8 @@
 #include <gtk/gtk.h>
 #include <libmate-desktop/mate-aboutdialog.h>
 
+#include <string.h>
+
 #include <mate-panel-applet.h>
 #include <mate-panel-applet-gsettings.h>
 
@@ -118,6 +120,51 @@ command_about_callback (GtkAction *action, CommandApplet *command_applet)
     NULL );
 }
 
+static void
+on_command_edit_start (GObject    *object,
+                       GParamSpec *pspec,
+                       gpointer    user_data)
+{
+    CommandApplet *command_applet = (CommandApplet *) user_data;
+    GtkEntry *entry = GTK_ENTRY (object);
+
+    /* stop current timer */
+    if (command_applet->timeout_id != 0)
+    {
+        g_source_remove (command_applet->timeout_id);
+        command_applet->timeout_id = 0;
+    }
+
+    if (gtk_entry_get_icon_name (entry, GTK_ENTRY_ICON_SECONDARY) == NULL)
+    {
+        gtk_entry_set_icon_from_icon_name (entry, GTK_ENTRY_ICON_SECONDARY, "document-save");
+        gtk_entry_set_icon_tooltip_text (entry, GTK_ENTRY_ICON_SECONDARY, _("Click to save and restart the command"));
+    }
+}
+
+static void
+on_command_edit_finish (GtkEntry *entry,
+                        gpointer  user_data)
+{
+    CommandApplet *command_applet = (CommandApplet *) user_data;
+
+    g_settings_set_string (command_applet->settings, COMMAND_KEY, gtk_entry_get_text (entry));
+
+    gtk_entry_set_icon_from_icon_name (entry, GTK_ENTRY_ICON_SECONDARY, NULL);
+    gtk_entry_set_icon_tooltip_text (entry, GTK_ENTRY_ICON_SECONDARY, NULL);
+
+    g_idle_add ((GSourceFunc) command_execute, command_applet);
+}
+
+static void
+on_icon_press (GtkEntry            *entry,
+               GtkEntryIconPosition icon_pos,
+               GdkEvent            *event,
+               gpointer             user_data)
+{
+    on_command_edit_finish (entry, user_data);
+}
+
 /* Show the preferences dialog */
 static void
 command_settings_callback (GtkAction *action, CommandApplet *command_applet)
@@ -200,8 +247,12 @@ command_settings_callback (GtkAction *action, CommandApplet *command_applet)
 
     g_signal_connect (dialog, "response", G_CALLBACK (gtk_widget_destroy), dialog);
 
-    /* use g_settings_bind to manage settings */
-    g_settings_bind (command_applet->settings, COMMAND_KEY, command, "text", G_SETTINGS_BIND_DEFAULT);
+    gtk_entry_set_text (GTK_ENTRY (command), command_applet->command);
+
+    g_signal_connect (command, "notify::text", G_CALLBACK (on_command_edit_start), command_applet);
+    g_signal_connect (command, "activate", G_CALLBACK (on_command_edit_finish), command_applet);
+    g_signal_connect (command, "icon-press", G_CALLBACK (on_icon_press), command_applet);
+
     g_settings_bind (command_applet->settings, INTERVAL_KEY, interval, "value", G_SETTINGS_BIND_DEFAULT);
     g_settings_bind (command_applet->settings, WIDTH_KEY, width, "value", G_SETTINGS_BIND_DEFAULT);
     g_settings_bind (command_applet->settings, SHOW_ICON_KEY, showicon, "active", G_SETTINGS_BIND_DEFAULT);
@@ -263,76 +314,167 @@ settings_interval_changed (GSettings *settings, gchar *key, CommandApplet *comma
     command_execute (command_applet);
 }
 
-static gboolean
-command_execute (CommandApplet *command_applet)
+static void
+process_command_output (CommandApplet *command_applet,
+                        gchar *output)
 {
-    GError *error = NULL;
-    gchar *output = NULL;
-    gint ret = 0;
+    gtk_widget_set_tooltip_text (GTK_WIDGET (command_applet->label), command_applet->command);
 
-    if (g_spawn_command_line_sync (command_applet->command, &output, NULL, &ret, &error))
+    if ((output == NULL) || (output[0] == 0))
     {
-        gtk_widget_set_tooltip_text (GTK_WIDGET (command_applet->label), command_applet->command);
+        gtk_label_set_text (command_applet->label, ERROR_OUTPUT);
+        return;
+    }
 
-        if ((output != NULL) && (output[0] != 0))
+    /* check if output is a custom GKeyFile */
+    if (g_str_has_prefix (output, "[Command]"))
+    {
+        GKeyFile *file = g_key_file_new ();
+        if (g_key_file_load_from_data (file, output, -1, G_KEY_FILE_NONE, NULL))
         {
-            /* check if output is a custom GKeyFile */
-            if (g_str_has_prefix (output, "[Command]"))
+            gchar *goutput = g_key_file_get_string (file, GK_COMMAND_GROUP, GK_COMMAND_OUTPUT, NULL);
+            gchar *icon = g_key_file_get_string (file, GK_COMMAND_GROUP, GK_COMMAND_ICON, NULL);
+
+            if (goutput)
             {
-                GKeyFile *file = g_key_file_new ();
-                if (g_key_file_load_from_data (file, output, -1, G_KEY_FILE_NONE, NULL))
-                {
-                    gchar *goutput = g_key_file_get_string (file, GK_COMMAND_GROUP, GK_COMMAND_OUTPUT, NULL);
-                    gchar *icon = g_key_file_get_string (file, GK_COMMAND_GROUP, GK_COMMAND_ICON, NULL);
-
-                    if (goutput)
-                    {
-                        gtk_label_set_use_markup (command_applet->label, TRUE);
-                        gtk_label_set_markup (command_applet->label, goutput);
-                    }
-                    if (icon)
-                        gtk_image_set_from_icon_name (command_applet->image, icon, 24);
-
-                    g_free (goutput);
-                    g_free (icon);
-                }
-                else
-                    gtk_label_set_text (command_applet->label, ERROR_OUTPUT);
-                g_key_file_free (file);
+                gtk_label_set_use_markup (command_applet->label, TRUE);
+                gtk_label_set_markup (command_applet->label, goutput);
             }
-            else
-            {
-                /* check output length */
-                if (strlen(output) > command_applet->width)
-                {
-                    GString *strip_output;
-                    strip_output = g_string_new_len (output, command_applet->width);
-                    g_free (output);
-                    output = strip_output->str;
-                    g_string_free (strip_output, FALSE);
-                }
-                /* remove last char if it is '\n' to avoid aligment problems */
-                if (g_str_has_suffix (output, "\n"))
-                {
-                    output[strlen(output) - 1] = 0;
-                }
 
-                gtk_label_set_text (command_applet->label, output);
-            }
+            if (icon)
+                gtk_image_set_from_icon_name (command_applet->image, icon, 24);
+
+            g_free (goutput);
+            g_free (icon);
         }
         else
             gtk_label_set_text (command_applet->label, ERROR_OUTPUT);
+
+        g_key_file_free (file);
     }
     else
-        gtk_label_set_text (command_applet->label, ERROR_OUTPUT);
+    {
+        /* check output length */
+        if (strlen(output) > command_applet->width)
+        {
+            GString *strip_output;
+            strip_output = g_string_new_len (output, command_applet->width);
+            g_free (output);
+            output = strip_output->str;
+            g_string_free (strip_output, FALSE);
+        }
 
-    g_free (output);
+        /* remove last char if it is '\n' to avoid alignment problems */
+        if (g_str_has_suffix (output, "\n"))
+        {
+            output[strlen(output) - 1] = 0;
+        }
+
+        gtk_label_set_text (command_applet->label, output);
+    }
+}
+
+static void
+on_command_done (GObject *source_object,
+                 GAsyncResult *res,
+                 gpointer user_data)
+{
+    char *stdout_buf = NULL;
+    char *stderr_buf = NULL;
+    gboolean success;
+
+    GSubprocess *subprocess = G_SUBPROCESS (source_object);
+    CommandApplet *command_applet = (CommandApplet *) user_data;
+
+    success = g_subprocess_communicate_utf8_finish (subprocess, res, &stdout_buf, &stderr_buf, NULL);
+    if (success)
+    {
+        process_command_output (command_applet, stdout_buf);
+    }
+    else
+    {
+        gtk_label_set_text (command_applet->label, ERROR_OUTPUT);
+    }
+
+    g_object_unref (subprocess);
+    g_free (stdout_buf);
+    g_free (stderr_buf);
 
     /* start timer for next execution */
     command_applet->timeout_id = g_timeout_add_seconds (command_applet->interval,
                                                         (GSourceFunc) command_execute,
                                                         command_applet);
+}
 
+static gchar **
+filter_empty_strings (gchar **strv)
+{
+    gchar **result;
+    guint i, j;
+
+    if (strv == NULL)
+        return NULL;
+
+    j = 0;
+    for (i = 0; strv[i] != 0; ++i)
+        if (strv[i][0] != '\0')
+            j++;
+
+    if (j == 0)
+        return NULL;
+
+    result = g_malloc_n (j + 1, sizeof (gchar *));
+    result[j] = NULL;
+
+    j = 0;
+    for (i = 0; strv[i] != 0; ++i)
+        if (strv[i][0] != '\0')
+            result[j++] = strv[i];
+
+    return result;
+}
+
+static gboolean
+command_execute (CommandApplet *command_applet)
+{
+    gchar **argv, **argv_filtered;
+    GSubprocess *subprocess;
+    gboolean executed = FALSE;
+
+    argv = g_strsplit (command_applet->command, " ", 0);
+    argv_filtered = filter_empty_strings (argv);
+    if (argv_filtered)
+    {
+        subprocess = g_subprocess_newv (argv_filtered, G_SUBPROCESS_FLAGS_STDOUT_PIPE, NULL);
+        if (subprocess)
+        {
+            g_subprocess_communicate_utf8_async (subprocess, NULL, NULL, on_command_done, command_applet);
+            executed = TRUE;
+        }
+        else
+        {
+            gtk_label_set_text (command_applet->label, ERROR_OUTPUT);
+        }
+    }
+    else
+        gtk_label_set_text (command_applet->label, ERROR_OUTPUT);
+
+    /* filter_empty_strings returns a shallow copy,
+     * so we should use g_free instead of g_strfreev
+     * on argv_filtered array.
+     */
+    g_free (argv_filtered);
+    g_strfreev (argv);
+
+    /* if command wasn't executed for some reason,
+     * start timer for next execution. otherwise
+     * it will be started from on_command_done
+     * callback after command output is processed.
+     */
+    if (!executed)
+        command_applet->timeout_id = g_timeout_add_seconds (command_applet->interval,
+                                                            (GSourceFunc) command_execute,
+                                                            command_applet);
     return FALSE;
 }
 
