@@ -32,6 +32,7 @@
 
 #include <mate-panel-applet.h>
 #include <mate-panel-applet-gsettings.h>
+#include "ma-command.h"
 
 /* Applet constants */
 #define APPLET_ICON    "utilities-terminal"
@@ -58,8 +59,11 @@ typedef struct
     GtkLabel          *label;
     GtkImage          *image;
     GtkBox            *box;
+    MaCommand         *command;
+    GCancellable      *cancellable;
+    gboolean           running;
 
-    gchar             *command;
+    gchar             *cmdline;
     gint               interval;
     gint               width;
 
@@ -69,6 +73,11 @@ typedef struct
 static void command_about_callback (GtkAction *action, CommandApplet *command_applet);
 static void command_settings_callback (GtkAction *action, CommandApplet *command_applet);
 static gboolean command_execute (CommandApplet *command_applet);
+static gboolean command_text_changed (GtkWidget *widget, GdkEvent  *event, gpointer user_data);
+static void interval_value_changed (GtkSpinButton *spin_button, gpointer user_data);
+static void width_value_changed (GtkSpinButton *spin_button, gpointer user_data);
+static void command_async_ready_callback (GObject *source_object, GAsyncResult *res, gpointer user_data);
+static gboolean timeout_callback (CommandApplet *command_applet);
 
 static const GtkActionEntry applet_menu_actions [] = {
     { "Preferences", "document-properties", N_("_Preferences"), NULL, NULL, G_CALLBACK (command_settings_callback) },
@@ -89,10 +98,15 @@ command_applet_destroy (MatePanelApplet *applet_widget, CommandApplet *command_a
         command_applet->timeout_id = 0;
     }
 
+    if (command_applet->cmdline != NULL)
+    {
+        g_free (command_applet->cmdline);
+        command_applet->cmdline = NULL;
+    }
+
     if (command_applet->command != NULL)
     {
-        g_free (command_applet->command);
-        command_applet->command = NULL;
+        g_object_unref (command_applet->command);
     }
 
     g_object_unref (command_applet->settings);
@@ -104,18 +118,65 @@ command_about_callback (GtkAction *action, CommandApplet *command_applet)
 {
     const char* authors[] = { "Stefano Karapetsas <stefano@karapetsas.com>", NULL };
 
-    char copyright[] = \
-         "Copyright \xc2\xa9 2015-2018 MATE developers\n"
-         "Copyright \xc2\xa9 2013-2014 Stefano Karapetsas";
-
     gtk_show_about_dialog(NULL,
+                          "title", _("About Command Applet"),
                           "version", VERSION,
-                          "copyright", copyright,
+                          "copyright", _("Copyright \xc2\xa9 2013-2014 Stefano Karapetsas\n"
+                                         "Copyright \xc2\xa9 2015-2019 MATE developers"),
                           "authors", authors,
                           "comments", _("Shows the output of a command"),
                           "translator-credits", _("translator-credits"),
                           "logo-icon-name", APPLET_ICON,
-    NULL );
+                          NULL );
+}
+
+static gboolean
+command_text_changed (GtkWidget *widget, GdkEvent  *event, gpointer user_data)
+{
+    const gchar *text;
+    CommandApplet *command_applet;
+
+    command_applet = (CommandApplet*) user_data;
+    text = gtk_entry_get_text (GTK_ENTRY(widget));
+    if (g_strcmp0(command_applet->cmdline, text) == 0) {
+        return TRUE;
+    }
+
+    if (strlen (text) == 0) {
+        gtk_label_set_text (command_applet->label, ERROR_OUTPUT);
+        return TRUE;
+    }
+
+    g_settings_set_string (command_applet->settings, COMMAND_KEY, text);
+    return TRUE;
+}
+
+static void interval_value_changed (GtkSpinButton *spin_button, gpointer user_data)
+{
+    gint value;
+    CommandApplet *command_applet;
+
+    command_applet = (CommandApplet*) user_data;
+    value = gtk_spin_button_get_value_as_int (spin_button);
+    if (command_applet->interval == value) {
+        return;
+    }
+
+    g_settings_set_int (command_applet->settings, INTERVAL_KEY, value);
+}
+
+static void width_value_changed (GtkSpinButton *spin_button, gpointer user_data)
+{
+    gint value;
+    CommandApplet *command_applet;
+
+    command_applet = (CommandApplet*) user_data;
+    value = gtk_spin_button_get_value_as_int (spin_button);
+    if (command_applet->width == value) {
+        return;
+    }
+
+    g_settings_set_int (command_applet->settings, WIDTH_KEY, value);
 }
 
 /* Show the preferences dialog */
@@ -174,10 +235,13 @@ command_settings_callback (GtkAction *action, CommandApplet *command_applet)
 
     g_signal_connect (dialog, "response", G_CALLBACK (gtk_widget_destroy), dialog);
 
+    g_signal_connect(command, "focus-out-event", G_CALLBACK (command_text_changed), command_applet);
+    g_signal_connect(interval, "value-changed", G_CALLBACK (interval_value_changed), command_applet);
+    g_signal_connect(width, "value-changed", G_CALLBACK (width_value_changed), command_applet);
     /* use g_settings_bind to manage settings */
-    g_settings_bind (command_applet->settings, COMMAND_KEY, command, "text", G_SETTINGS_BIND_DEFAULT);
-    g_settings_bind (command_applet->settings, INTERVAL_KEY, interval, "value", G_SETTINGS_BIND_DEFAULT);
-    g_settings_bind (command_applet->settings, WIDTH_KEY, width, "value", G_SETTINGS_BIND_DEFAULT);
+    g_settings_bind (command_applet->settings, COMMAND_KEY, command, "text", G_SETTINGS_BIND_GET_NO_CHANGES);
+    g_settings_bind (command_applet->settings, INTERVAL_KEY, interval, "value", G_SETTINGS_BIND_GET_NO_CHANGES);
+    g_settings_bind (command_applet->settings, WIDTH_KEY, width, "value", G_SETTINGS_BIND_GET_NO_CHANGES);
     g_settings_bind (command_applet->settings, SHOW_ICON_KEY, showicon, "active", G_SETTINGS_BIND_DEFAULT);
 
     gtk_widget_show_all (GTK_WIDGET (dialog));
@@ -187,17 +251,27 @@ command_settings_callback (GtkAction *action, CommandApplet *command_applet)
 static void
 settings_command_changed (GSettings *settings, gchar *key, CommandApplet *command_applet)
 {
-    gchar *command;
+    GError *error = NULL;
+    gchar *cmdline;
+    gchar **argv;
 
-    command = g_settings_get_string (command_applet->settings, COMMAND_KEY);
+    cmdline = g_settings_get_string (command_applet->settings, COMMAND_KEY);
+    if (strlen (cmdline) == 0 || g_strcmp0(command_applet->cmdline, cmdline) == 0)
+        return;
 
-    if (command_applet->command)
-        g_free (command_applet->command);
+    if (!g_shell_parse_argv (cmdline, NULL, &argv, &error))
+    {
+        gtk_label_set_text (command_applet->label, ERROR_OUTPUT);
+        g_clear_error (&error);
+        return;
+    }
+    g_strfreev(argv);
 
-    if (command != NULL && command[0] != 0)
-        command_applet->command = command;
-    else
-        command_applet->command = g_strdup ("");
+    if (command_applet->cmdline)
+        g_free (command_applet->cmdline);
+    command_applet->cmdline = cmdline;
+
+    command_execute (command_applet);
 }
 
 static void
@@ -207,10 +281,9 @@ settings_width_changed (GSettings *settings, gchar *key, CommandApplet *command_
 
     width = g_settings_get_int (command_applet->settings, WIDTH_KEY);
 
-    command_applet->width = width;
-
-    /* execute command to start new timer */
-    command_execute (command_applet);
+    if (command_applet->width != width) {
+        command_applet->width = width;
+    }
 }
 
 static void
@@ -224,23 +297,18 @@ settings_interval_changed (GSettings *settings, gchar *key, CommandApplet *comma
     if (interval < 1)
         interval = 1;
 
+    if (command_applet->interval == interval) {
+        return;
+    }
     command_applet->interval = interval;
 
-    /* stop current timer */
-    if (command_applet->timeout_id != 0)
-    {
-        g_source_remove (command_applet->timeout_id);
-        command_applet->timeout_id = 0;
-    }
-
-    /* execute command to start new timer */
     command_execute (command_applet);
 }
 
 static void
 process_command_output (CommandApplet *command_applet, gchar *output)
 {
-    gtk_widget_set_tooltip_text (GTK_WIDGET (command_applet->label), command_applet->command);
+    gtk_widget_set_tooltip_text (GTK_WIDGET (command_applet->label), command_applet->cmdline);
 
     if ((output == NULL) || (output[0] == '\0'))
     {
@@ -289,28 +357,82 @@ process_command_output (CommandApplet *command_applet, gchar *output)
     }
 }
 
+static void command_async_ready_callback (GObject *source_object, GAsyncResult *res, gpointer user_data)
+{
+    gchar *output;
+    GError *error = NULL;
+    CommandApplet *command_applet;
+
+    command_applet = (CommandApplet*) user_data;
+
+    output = ma_command_run_finish (command_applet->command, res, &error);
+    if (error == NULL) {
+        process_command_output (command_applet, output);
+    } else {
+        if (!g_error_matches (error, G_IO_ERROR, G_IO_ERROR_FAILED)) {
+            gtk_label_set_text (command_applet->label, ERROR_OUTPUT);
+        }
+        g_error_free (error);
+    }
+    g_free (output);
+    command_applet->running = FALSE;
+}
+
+static gboolean timeout_callback (CommandApplet *command_applet)
+{
+    /* command is empty, wait for next timer execution */
+    if (strlen (command_applet->cmdline) == 0) {
+        return G_SOURCE_CONTINUE;
+    }
+
+    /* command running, wait for next timer execution */
+    if (command_applet->running) {
+        return G_SOURCE_CONTINUE;
+    } else {
+        gchar **argv;
+        GError *error = NULL;
+        if (!g_shell_parse_argv (command_applet->cmdline, NULL, &argv, &error)) {
+            gtk_label_set_text (command_applet->label, ERROR_OUTPUT);
+            g_clear_error (&error);
+            return G_SOURCE_CONTINUE;
+        }
+        g_strfreev(argv);
+        command_execute (command_applet);
+        return G_SOURCE_REMOVE;
+    }
+}
+
 static gboolean
 command_execute (CommandApplet *command_applet)
 {
-    GError *error = NULL;
-    gchar *output = NULL;
-    gint ret = 0;
-
-    if (g_spawn_command_line_sync (command_applet->command, &output, NULL, &ret, &error))
+    /* stop current timer */
+    if (command_applet->timeout_id != 0)
     {
-        process_command_output (command_applet, output);
+        g_source_remove (command_applet->timeout_id);
+        command_applet->timeout_id = 0;
     }
-    else
-        gtk_label_set_text (command_applet->label, ERROR_OUTPUT);
 
-    g_free (output);
+    if (command_applet->running) {
+        g_cancellable_cancel (command_applet->cancellable);
+    }
 
-    /* start timer for next execution */
+    g_object_set (G_OBJECT(command_applet->command), "command", command_applet->cmdline, NULL);
+    ma_command_run_async (command_applet->command,
+                          command_applet->cancellable,
+                          command_async_ready_callback,
+                          command_applet);
+    if (!command_applet->running) {
+        command_applet->running = TRUE;
+    }
+
+    if (g_cancellable_is_cancelled (command_applet->cancellable)) {
+        g_cancellable_reset (command_applet->cancellable);
+    }
+
     command_applet->timeout_id = g_timeout_add_seconds (command_applet->interval,
-                                                        (GSourceFunc) command_execute,
+                                                        (GSourceFunc) timeout_callback,
                                                         command_applet);
-
-    return FALSE;
+    return G_SOURCE_CONTINUE;
 }
 
 static gboolean
@@ -329,8 +451,10 @@ command_applet_fill (MatePanelApplet* applet)
     command_applet->settings = mate_panel_applet_settings_new (applet, COMMAND_SCHEMA);
 
     command_applet->interval = g_settings_get_int (command_applet->settings, INTERVAL_KEY);
-    command_applet->command = g_settings_get_string (command_applet->settings, COMMAND_KEY);
+    command_applet->cmdline = g_settings_get_string (command_applet->settings, COMMAND_KEY);
     command_applet->width = g_settings_get_int (command_applet->settings, WIDTH_KEY);
+    command_applet->command = ma_command_new(command_applet->cmdline, NULL);
+    command_applet->cancellable = g_cancellable_new ();
 
     command_applet->box = GTK_BOX (gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0));
     command_applet->image = GTK_IMAGE (gtk_image_new_from_icon_name (APPLET_ICON, 24));
@@ -382,7 +506,6 @@ command_applet_fill (MatePanelApplet* applet)
 
     /* first command execution */
     command_execute (command_applet);
-
     return TRUE;
 }
 
